@@ -79,6 +79,13 @@ type UploadedAttachment = {
   error?: string;
 };
 
+type GeneratedImage = {
+  id: string;
+  prompt: string;
+  imageUrl: string;
+  createdAt: string;
+};
+
 // Main chatbot page.
 export default function Home() {
   // Control sidebar visibility.
@@ -96,6 +103,21 @@ export default function Home() {
   // Control the attachment menu visibility.
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
 
+  // Control image generation mode in the composer.
+  const [imageMode, setImageMode] = useState(false);
+
+  // Store the image generation prompt.
+  const [imagePrompt, setImagePrompt] = useState("");
+
+  // Track image generation loading state.
+  const [imageGenerating, setImageGenerating] = useState(false);
+
+  // Keep generated images in the current chat session.
+  const [generatedImages, setGeneratedImages] = useState<GeneratedImage[]>([]);
+
+  // Detect clicks outside the attachment menu.
+  const attachMenuRef = useRef<HTMLDivElement | null>(null);
+
   // Store conversations loaded from MongoDB.
   const [conversations, setConversations] = useState<Conversation[]>([]);
 
@@ -104,8 +126,11 @@ export default function Home() {
     string | null
   >(null);
 
-  // Keep the conversation ID available to event handlers.
+  // Keep the conversation ID available to the API transport.
   const conversationIdRef = useRef<string | null>(null);
+
+  // Keep uploaded MongoDB file IDs available to the API transport.
+  const attachmentIdsRef = useRef<string[]>([]);
 
   // Track whether a conversation is being created.
   const [creatingConversation, setCreatingConversation] = useState(false);
@@ -128,11 +153,14 @@ export default function Home() {
   const [actionLoading, setActionLoading] = useState(false);
 
   // Configure the backend transport.
-  // Dynamic conversation and attachment data is passed when sending a message.
   const transport = useMemo(
     () =>
       new DefaultChatTransport({
         api: "/api/chat",
+        body: () => ({
+          conversationId: conversationIdRef.current,
+          attachmentIds: attachmentIdsRef.current,
+        }),
       }),
     [],
   );
@@ -169,25 +197,22 @@ export default function Home() {
     loadConversations();
   }, []);
 
-  // Close the conversation options menu when clicking outside it.
+  // Close the attachment menu when the user clicks outside it.
   useEffect(() => {
-    function handleOutsideClick(event: MouseEvent) {
-      const target = event.target;
+    if (!attachMenuOpen) return;
 
+    function handleOutsideClick(event: MouseEvent) {
       if (
-        target instanceof Element &&
-        !target.closest("[data-conversation-menu]")
+        attachMenuRef.current &&
+        !attachMenuRef.current.contains(event.target as Node)
       ) {
-        setOpenMenuId(null);
+        setAttachMenuOpen(false);
       }
     }
 
     document.addEventListener("mousedown", handleOutsideClick);
-
-    return () => {
-      document.removeEventListener("mousedown", handleOutsideClick);
-    };
-  }, []);
+    return () => document.removeEventListener("mousedown", handleOutsideClick);
+  }, [attachMenuOpen]);
 
   // Sort pinned conversations first, then by recent activity.
   const sortedConversations = useMemo(() => {
@@ -248,6 +273,11 @@ export default function Home() {
 
       // Clear attachments from the previous composer.
       setAttachments([]);
+
+      // Generated images are currently kept in local chat state only.
+      setGeneratedImages([]);
+      setImageMode(false);
+      setImagePrompt("");
 
       // Close the attachment menu.
       setAttachMenuOpen(false);
@@ -315,6 +345,11 @@ export default function Home() {
 
     // Clear selected attachments.
     setAttachments([]);
+
+    // Clear generated images and exit image mode.
+    setGeneratedImages([]);
+    setImageMode(false);
+    setImagePrompt("");
 
     // Close the attachment menu.
     setAttachMenuOpen(false);
@@ -513,24 +548,20 @@ export default function Home() {
         )
         .map((attachment) => attachment._id as string);
 
-      // Send the message with the conversation ID and uploaded file IDs.
-      await sendMessage(
-        {
-          text:
-            trimmedInput ||
-            "Please analyze the attached file and explain its contents in Somali.",
-        },
-        {
-          body: {
-            conversationId: conversationIdRef.current,
-            attachmentIds: uploadedAttachmentIds,
-          },
-        },
-      );
+      // Make the selected file IDs available to the transport request.
+      attachmentIdsRef.current = uploadedAttachmentIds;
+
+      // Send the user message to the AI with the selected file IDs in the request body.
+      await sendMessage({
+        text:
+          trimmedInput ||
+          "Please analyze the attached file and explain its contents in Somali.",
+      });
 
       // Clear the composer and selected attachments after sending.
       setInput("");
       setAttachments([]);
+      attachmentIdsRef.current = [];
 
       // Refresh conversations to update their latest activity.
       await loadConversations();
@@ -540,6 +571,53 @@ export default function Home() {
     } finally {
       // Allow another conversation action.
       setCreatingConversation(false);
+    }
+  }
+
+  // Generate an image using the backend API.
+  async function handleGenerateImage(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const prompt = imagePrompt.trim();
+
+    if (!prompt || imageGenerating) return;
+
+    try {
+      setImageGenerating(true);
+
+      const response = await fetch("/api/generate-image", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ prompt }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok || !data.success || !data.image) {
+        throw new Error(data.message || "Image generation failed.");
+      }
+
+      const newImage: GeneratedImage = {
+        id: crypto.randomUUID(),
+        prompt,
+        imageUrl: data.image,
+        createdAt: new Date().toISOString(),
+      };
+
+      setGeneratedImages((previous) => [...previous, newImage]);
+      setImagePrompt("");
+      setImageMode(false);
+    } catch (generationError) {
+      console.error("Image generation error:", generationError);
+      alert(
+        generationError instanceof Error
+          ? generationError.message
+          : "Something went wrong while generating the image.",
+      );
+    } finally {
+      setImageGenerating(false);
     }
   }
 
@@ -766,7 +844,6 @@ export default function Home() {
                 sortedConversations.map((conversation) => (
                   <div
                     key={conversation._id}
-                    data-conversation-menu
                     className={`group relative mb-1 flex items-center rounded-lg ${
                       activeConversationId === conversation._id
                         ? "bg-[#2a2a2a]"
@@ -1055,6 +1132,49 @@ export default function Home() {
               )}
             </div>
           )}
+
+          {/* Generated images, displayed as a clean ChatGPT-style result. */}
+          {generatedImages.length > 0 && (
+            <div className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-4 pb-8">
+              {generatedImages.map((generatedImage) => (
+                <div
+                  key={generatedImage.id}
+                  className="flex w-full flex-col items-end gap-3"
+                >
+                  <div className="max-w-[85%] rounded-[24px] bg-[#303030] px-4 py-3 text-sm leading-6 text-white">
+                    {generatedImage.prompt}
+                  </div>
+                  <div className="w-full max-w-[560px] overflow-hidden rounded-2xl">
+                    <a
+                      href={generatedImage.imageUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="block"
+                      title="Open generated image"
+                    >
+                      <img
+                        src={generatedImage.imageUrl}
+                        alt={generatedImage.prompt}
+                        className="block h-auto max-h-[720px] w-full rounded-2xl object-contain"
+                      />
+                    </a>
+                    <div className="mt-2 flex items-center justify-between px-1">
+                      <span className="text-xs text-gray-500">
+                        Generated image
+                      </span>
+                      <a
+                        href={generatedImage.imageUrl}
+                        download="tt-generated-image.png"
+                        className="rounded-lg px-3 py-1.5 text-xs text-gray-300 transition hover:bg-[#303030] hover:text-white"
+                      >
+                        Download
+                      </a>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Message composer */}
@@ -1126,7 +1246,7 @@ export default function Home() {
                           previous.filter((item) => item.id !== attachment.id),
                         )
                       }
-                      className="rounded-lg p-1.5 text-gray-400 hover:bg-[#484848] hover:text-white"
+                      className="cursor-pointer rounded-lg p-1.5 text-gray-400 hover:bg-[#484848] hover:text-white"
                       aria-label="Remove attachment"
                     >
                       <X size={16} />
@@ -1144,13 +1264,33 @@ export default function Home() {
               </p>
             )}
 
-            {/* Chat composer form. */}
+            {/* Image generation mode indicator. */}
+            {imageMode && (
+              <div className="mb-2 flex items-center justify-between rounded-xl border border-[#424242] bg-[#303030] px-4 py-2.5">
+                <div className="flex items-center gap-2 text-sm text-gray-200">
+                  <ImagePlus size={17} />
+                  <span>Image generation</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setImageMode(false);
+                    setImagePrompt("");
+                  }}
+                  className="cursor-pointer rounded-lg px-2 py-1 text-xs text-gray-400 transition-colors hover:bg-[#424242] hover:text-white"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+
+            {/* Chat and image generation share the same composer. */}
             <form
-              onSubmit={handleSubmit}
+              onSubmit={imageMode ? handleGenerateImage : handleSubmit}
               className="flex items-end gap-3 rounded-3xl border border-[#424242] bg-[#303030] p-3 shadow-lg"
             >
               {/* Attachment menu and its trigger. */}
-              <div className="relative mb-1">
+              <div ref={attachMenuRef} className="relative mb-1">
                 <button
                   type="button"
                   onClick={() => setAttachMenuOpen((previous) => !previous)}
@@ -1162,130 +1302,69 @@ export default function Home() {
                   <Paperclip size={20} />
                 </button>
 
-                {/* ChatGPT-style attachment menu. */}
+                {/* Compact attachment menu with the five requested actions. */}
                 {attachMenuOpen && (
-                  <div className="absolute bottom-14 left-0 z-50 w-[390px] max-w-[85vw] rounded-2xl border border-[#424242] bg-[#303030] p-2 shadow-2xl">
-                    {/* Upload from computer: this option is functional. */}
+                  <div className="absolute bottom-14 left-0 z-50 w-[280px] max-w-[85vw] rounded-2xl border border-[#424242] bg-[#252525] p-2 shadow-2xl">
                     <button
                       type="button"
                       onClick={() => {
                         setAttachMenuOpen(false);
                         open();
                       }}
-                      className="flex w-full items-center gap-3 rounded-xl bg-[#424242] px-3 py-3 text-left hover:bg-[#505050]"
+                      className="flex w-full cursor-pointer items-center gap-3 rounded-xl px-3 py-3 text-left text-sm text-gray-100 transition hover:bg-[#383838]"
                     >
-                      <Paperclip size={20} />
-                      <span className="text-sm font-medium">
-                        Add photos &amp; files
-                      </span>
-                      <span className="ml-auto text-xs text-gray-400">
-                        Upload from computer
-                      </span>
+                      <Paperclip size={18} className="text-gray-300" />
+                      <span>Add from file</span>
                     </button>
 
-                    {/* Library option is a visual placeholder for a future feature. */}
                     <button
                       type="button"
                       disabled
-                      className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left opacity-60"
+                      title="Library support will be added later"
+                      className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm text-gray-400 opacity-60"
                     >
-                      <FolderOpen size={20} />
-                      <span className="text-sm">Add from library</span>
-                      <span className="ml-auto text-xs text-gray-400">
-                        Browse your files
-                      </span>
+                      <FolderOpen size={18} />
+                      <span>Add from library</span>
+                      <span className="ml-auto text-[10px]">Soon</span>
                     </button>
 
-                    {/* Image generation option is not connected yet. */}
                     <button
                       type="button"
-                      disabled
-                      className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left opacity-60"
+                      onClick={() => {
+                        setImageMode(true);
+                        setImagePrompt("");
+                        setAttachMenuOpen(false);
+                      }}
+                      className="flex w-full cursor-pointer items-center gap-3 rounded-xl px-3 py-3 text-left text-sm text-gray-100 transition hover:bg-[#383838]"
                     >
-                      <ImagePlus size={20} />
-                      <span className="text-sm">Create image</span>
-                      <span className="ml-auto text-xs text-gray-400">
-                        Visualize anything
-                      </span>
+                      <ImagePlus size={18} className="text-gray-300" />
+                      <span>Create image</span>
                     </button>
 
-                    {/* Web search option is not connected yet. */}
+                    <div className="my-1 border-t border-[#3a3a3a]" />
+
                     <button
                       type="button"
-                      disabled
-                      className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left opacity-60"
+                      onClick={() => {
+                        setAttachMenuOpen(false);
+                        open();
+                      }}
+                      className="flex w-full cursor-pointer items-center gap-3 rounded-xl px-3 py-3 text-left text-sm text-gray-100 transition hover:bg-[#383838]"
                     >
-                      <Globe size={20} />
-                      <span className="text-sm">Web search</span>
-                      <span className="ml-auto text-xs text-gray-400">
-                        Find real-time news and info
-                      </span>
+                      <FileType size={18} className="text-gray-300" />
+                      <span>PDF</span>
                     </button>
 
-                    {/* Deep research option is not connected yet. */}
                     <button
                       type="button"
-                      disabled
-                      className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left opacity-60"
+                      onClick={() => {
+                        setAttachMenuOpen(false);
+                        open();
+                      }}
+                      className="flex w-full cursor-pointer items-center gap-3 rounded-xl px-3 py-3 text-left text-sm text-gray-100 transition hover:bg-[#383838]"
                     >
-                      <Telescope size={20} />
-                      <span className="text-sm">Deep research</span>
-                      <span className="ml-auto text-xs text-gray-400">
-                        Get a detailed report
-                      </span>
-                    </button>
-
-                    {/* Sketch option is not connected yet. */}
-                    <button
-                      type="button"
-                      disabled
-                      className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left opacity-60"
-                    >
-                      <PenTool size={20} />
-                      <span className="text-sm">Sketch</span>
-                      <span className="ml-auto text-xs text-gray-400">
-                        Draw and attach an image
-                      </span>
-                    </button>
-
-                    {/* Template Creator option is not connected yet. */}
-                    <button
-                      type="button"
-                      disabled
-                      className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left opacity-60"
-                    >
-                      <LayoutTemplate size={20} />
-                      <span className="text-sm">Template Creator</span>
-                    </button>
-
-                    {/* Presentations option is not connected yet. */}
-                    <button
-                      type="button"
-                      disabled
-                      className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left opacity-60"
-                    >
-                      <Presentation size={20} />
-                      <span className="text-sm">Presentations</span>
-                    </button>
-
-                    {/* PDF option is not connected yet. */}
-                    <button
-                      type="button"
-                      disabled
-                      className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left opacity-60"
-                    >
-                      <FileType size={20} />
-                      <span className="text-sm">PDF</span>
-                    </button>
-
-                    {/* Documents option is not connected yet. */}
-                    <button
-                      type="button"
-                      disabled
-                      className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left opacity-60"
-                    >
-                      <FileText size={20} />
-                      <span className="text-sm">Documents</span>
+                      <FileText size={18} className="text-gray-300" />
+                      <span>Documentation</span>
                     </button>
                   </div>
                 )}
@@ -1293,15 +1372,23 @@ export default function Home() {
 
               {/* User message input. */}
               <textarea
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
+                value={imageMode ? imagePrompt : input}
+                onChange={(event) =>
+                  imageMode
+                    ? setImagePrompt(event.target.value)
+                    : setInput(event.target.value)
+                }
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
                     event.currentTarget.form?.requestSubmit();
                   }
                 }}
-                placeholder="Ask TT chatbot..."
+                placeholder={
+                  imageMode
+                    ? "Describe the image you want to create..."
+                    : "Ask TT chatbot..."
+                }
                 rows={1}
                 className="max-h-40 min-h-10 flex-1 resize-none bg-transparent px-1 py-2 text-sm text-white outline-none placeholder:text-gray-500"
               />
@@ -1310,16 +1397,30 @@ export default function Home() {
               <button
                 type="submit"
                 disabled={
-                  (!input.trim() && attachments.length === 0) ||
-                  status !== "ready" ||
-                  creatingConversation ||
-                  attachments.some((file) => file.status === "uploading") ||
-                  attachments.some((file) => file.status === "error")
+                  imageMode
+                    ? !imagePrompt.trim() || imageGenerating
+                    : (!input.trim() && attachments.length === 0) ||
+                      status !== "ready" ||
+                      creatingConversation ||
+                      attachments.some((file) => file.status === "uploading") ||
+                      attachments.some((file) => file.status === "error")
                 }
-                className="mb-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white text-black transition hover:bg-gray-200 disabled:cursor-not-allowed disabled:bg-[#555555] disabled:text-gray-400"
-                aria-label="Send message"
+                className={`${
+                  imageMode
+                    ? "mb-1 flex h-9 shrink-0 items-center justify-center gap-2 rounded-full bg-white px-4 text-sm font-medium text-black transition hover:bg-gray-200 disabled:cursor-not-allowed disabled:bg-[#555555] disabled:text-gray-400"
+                    : "mb-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white text-black transition hover:bg-gray-200 disabled:cursor-not-allowed disabled:bg-[#555555] disabled:text-gray-400"
+                }`}
+                aria-label={imageMode ? "Generate image" : "Send message"}
               >
-                <ArrowUp size={20} />
+                {imageMode ? (
+                  imageGenerating ? (
+                    "Generating..."
+                  ) : (
+                    "Generate"
+                  )
+                ) : (
+                  <ArrowUp size={20} />
+                )}
               </button>
             </form>
           </div>
